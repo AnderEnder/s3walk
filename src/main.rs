@@ -1,63 +1,15 @@
 use failure::Error;
 use futures::compat::Future01CompatExt;
 use futures::future::join_all;
-use futures::join;
 use rusoto_core::Region;
 use rusoto_s3::*;
 
-async fn dirs(
-    client: &S3Client,
-    bucket: String,
-    path: Option<String>,
-) -> Result<Vec<Option<String>>, Error> {
-    let mut dirs = Vec::new();
-    let mut files = Vec::new();
-
-    let mut token = None;
-
-    loop {
-        let req = ListObjectsV2Request {
-            bucket: bucket.clone(),
-            delimiter: Some("/".to_owned()),
-            prefix: path.clone(),
-            continuation_token: token.clone(),
-            ..Default::default()
-        };
-        let rs = client.list_objects_v2(req).compat().await?;
-
-        let ListObjectsV2Output {
-            common_prefixes,
-            contents,
-            continuation_token,
-            ..
-        } = rs;
-
-        let mut common: Vec<_> = common_prefixes
-            .unwrap_or_else(|| Vec::new())
-            .into_iter()
-            .map(|x| {
-                let CommonPrefix { prefix } = x;
-                prefix
-            })
-            .collect();
-        let mut contents = contents.unwrap_or_else(|| Vec::new());
-
-        dirs.append(&mut common);
-        files.append(&mut contents);
-
-        if continuation_token.is_none() {
-            break;
-        } else {
-            token = continuation_token;
-        }
-    }
-
-    // let files = contents.unwrap_or_else(|| Vec::new());
-
-    Ok(dirs)
-}
-
-type S3List = (Vec<Option<String>>, Vec<Object>, Option<String>);
+type S3List = (
+    Vec<Option<String>>,
+    Vec<Object>,
+    Option<String>,
+    Option<String>,
+);
 
 async fn list_dirs(
     client: &S3Client,
@@ -69,7 +21,8 @@ async fn list_dirs(
         bucket: bucket.clone(),
         delimiter: Some("/".to_owned()),
         prefix: path.clone(),
-        continuation_token: token.clone(),
+        continuation_token: token,
+        max_keys: Some(2),
         ..Default::default()
     };
     let rs = client.list_objects_v2(req).compat().await?;
@@ -77,7 +30,7 @@ async fn list_dirs(
     let ListObjectsV2Output {
         common_prefixes,
         contents,
-        continuation_token,
+        next_continuation_token,
         ..
     } = rs;
 
@@ -92,38 +45,48 @@ async fn list_dirs(
 
     let contents = contents.unwrap_or_else(|| Vec::new());
 
-    Ok((common, contents, continuation_token))
+    Ok((common, contents, path, next_continuation_token))
 }
 
 async fn main_async() {
     let client = S3Client::new(Region::UsEast1);
     let bucket = "ander-test".to_owned();
     let path = None;
-    let mut search_paths: Vec<Option<String>> = vec![path];
+
+    let mut search_paths = vec![path];
     let mut full_dirs = Vec::new();
+    let mut full_objects = Vec::new();
+    let parallel = 8_usize;
+    let mut tasks = Vec::new();
 
     while search_paths.len() > 0 {
-        let slice_paths: Vec<_> = search_paths.took(4);
-
+        let slice_paths = search_paths.took(parallel - tasks.len());
         full_dirs.append(&mut slice_paths.clone());
 
-        let future_paths: Vec<_> = slice_paths
+        let mut new_tasks: Vec<_> = slice_paths
             .into_iter()
-            .map(|x| dirs(&client, bucket.clone(), x))
+            .map(|prefix| list_dirs(&client, bucket.clone(), prefix, None))
             .collect();
 
-        let dirs: Vec<_> = join_all(future_paths)
+        new_tasks.append(&mut tasks);
+
+        let results: Vec<_> = join_all(new_tasks)
             .await
             .into_iter()
             .map(|x| x.unwrap())
             .collect();
 
-        for mut path_set in dirs.into_iter() {
-            search_paths.append(&mut path_set);
+        for (mut dirs, mut objects, prefix, token) in results.into_iter() {
+            search_paths.append(&mut dirs);
+            full_objects.append(&mut objects);
+            if token.is_some() {
+                tasks.push(list_dirs(&client, bucket.clone(), prefix, token));
+            }
         }
     }
 
     println!("{:#?}", full_dirs);
+    println!("{:#?}", full_objects);
 }
 
 fn main() {
@@ -137,6 +100,7 @@ trait TookVector {
 impl<T> TookVector for Vec<T> {
     fn took(&mut self, n: usize) -> Self {
         let mut res = Vec::new();
+
         for _i in 0..n {
             let element = self.pop();
             if let Some(x) = element {
