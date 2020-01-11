@@ -3,6 +3,7 @@ use futures::compat::Future01CompatExt;
 use futures::future::join_all;
 use rusoto_core::Region;
 use rusoto_s3::*;
+use std::process::exit;
 
 type S3List = (
     Vec<Option<String>>,
@@ -35,7 +36,7 @@ async fn list_dirs(
     } = rs;
 
     let common: Vec<_> = common_prefixes
-        .unwrap_or_else(|| Vec::new())
+        .unwrap_or_else(Vec::new)
         .into_iter()
         .map(|x| {
             let CommonPrefix { prefix } = x;
@@ -43,7 +44,7 @@ async fn list_dirs(
         })
         .collect();
 
-    let contents = contents.unwrap_or_else(|| Vec::new());
+    let contents = contents.unwrap_or_else(Vec::new);
 
     Ok((common, contents, path, next_continuation_token))
 }
@@ -59,7 +60,7 @@ async fn main_async() {
     let parallel = 8_usize;
     let mut tasks = Vec::new();
 
-    while search_paths.len() > 0 {
+    while !search_paths.is_empty() {
         let slice_paths = search_paths.took(parallel - tasks.len());
         full_dirs.append(&mut slice_paths.clone());
 
@@ -73,7 +74,13 @@ async fn main_async() {
         let results: Vec<_> = join_all(new_tasks)
             .await
             .into_iter()
-            .map(|x| x.unwrap())
+            .filter_map(|x| {
+                x.map_err(|e| {
+                    eprintln!("{}", e);
+                    exit(1);
+                })
+                .ok()
+            })
             .collect();
 
         for (mut dirs, mut objects, prefix, token) in results.into_iter() {
@@ -93,11 +100,11 @@ fn main() {
     tokio_compat::run_std(main_async());
 }
 
-trait TookVector {
+trait Took {
     fn took(&mut self, n: usize) -> Self;
 }
 
-impl<T> TookVector for Vec<T> {
+impl<T> Took for Vec<T> {
     fn took(&mut self, n: usize) -> Self {
         let mut res = Vec::new();
 
