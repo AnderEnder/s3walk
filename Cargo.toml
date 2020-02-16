@@ -5,21 +5,19 @@ authors = ["Andrii Radyk <ander.ender@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-rusoto_credential = "0.42"
+rusoto_credential = "0.43.0-beta.1"
 structopt = "0.3"
 failure = "0.1"
 chrono = "0.4"
-futures = { version = "0.3", features = ["compat"] }
-futures01 = { package = "futures", version = "0.1", optional = true }
+futures = "0.3"
 tokio = { version = "0.2", features = ["full"] }
-tokio-compat = "0.1"
 
 [dependencies.rusoto_core]
-version = "0.42"
+version = "0.43.0-beta.1"
 default-features = false
 features = [ "rustls" ]
 
 [dependencies.rusoto_s3]
-version = "0.42"
+version = "0.43.0-beta.1"
 default-features = false
 features = [ "rustls" ]

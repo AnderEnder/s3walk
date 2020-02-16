@@ -1,5 +1,4 @@
 use failure::Error;
-use futures::compat::Future01CompatExt;
 use futures::future::join_all;
 use rusoto_core::Region;
 use rusoto_s3::*;
@@ -26,7 +25,7 @@ async fn list_dirs(
         max_keys: Some(2),
         ..Default::default()
     };
-    let rs = client.list_objects_v2(req).compat().await?;
+    let rs = client.list_objects_v2(req).await?;
 
     let ListObjectsV2Output {
         common_prefixes,
@@ -49,7 +48,8 @@ async fn list_dirs(
     Ok((common, contents, path, next_continuation_token))
 }
 
-async fn main_async() {
+#[tokio::main]
+async fn main() {
     let client = S3Client::new(Region::UsEast1);
     let bucket = "ander-test".to_owned();
     let path = None;
@@ -94,10 +94,6 @@ async fn main_async() {
 
     println!("{:#?}", full_dirs);
     println!("{:#?}", full_objects);
-}
-
-fn main() {
-    tokio_compat::run_std(main_async());
 }
 
 trait Took {
