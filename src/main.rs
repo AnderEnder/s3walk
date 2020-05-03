@@ -1,3 +1,4 @@
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use failure::Error;
 use futures::future::join_all;
 use rusoto_core::Region;
@@ -16,6 +17,7 @@ async fn list_dirs(
     bucket: String,
     path: Option<String>,
     token: Option<String>,
+    sender: Sender<Option<String>>,
 ) -> Result<S3List, Error> {
     let req = ListObjectsV2Request {
         bucket: bucket.clone(),
@@ -45,6 +47,12 @@ async fn list_dirs(
 
     let contents = contents.unwrap_or_else(Vec::new);
 
+    for prefix in common.iter() {
+        if let Some(p) = prefix {
+            sender.send(Some(p.to_owned())).unwrap();
+        }
+    }
+
     Ok((common, contents, path, next_continuation_token))
 }
 
@@ -54,19 +62,25 @@ async fn main() {
     let bucket = "ander-test".to_owned();
     let path = None;
 
-    let mut search_paths = vec![path];
-    let mut full_dirs = Vec::new();
+    let (sender, receiver) = unbounded::<Option<String>>();
+    sender.send(path.clone()).unwrap();
+
     let mut full_objects = Vec::new();
     let parallel = 8_usize;
     let mut tasks = Vec::new();
 
-    while !search_paths.is_empty() {
-        let slice_paths = search_paths.took(parallel - tasks.len());
-        full_dirs.append(&mut slice_paths.clone());
-
-        let mut new_tasks: Vec<_> = slice_paths
-            .into_iter()
-            .map(|prefix| list_dirs(&client, bucket.clone(), prefix, None))
+    while !receiver.is_empty() || tasks.len() != 0 {
+        let mut new_tasks: Vec<_> = (0..(parallel - tasks.len()))
+            .filter_map(|_| match receiver.try_recv() {
+                Ok(path) => Some(list_dirs(
+                    &client,
+                    bucket.clone(),
+                    path,
+                    None,
+                    sender.clone(),
+                )),
+                _ => None,
+            })
             .collect();
 
         new_tasks.append(&mut tasks);
@@ -83,36 +97,21 @@ async fn main() {
             })
             .collect();
 
-        for (mut dirs, mut objects, prefix, token) in results.into_iter() {
-            search_paths.append(&mut dirs);
+        for (mut _dirs, mut objects, prefix, token) in results.into_iter() {
             full_objects.append(&mut objects);
             if token.is_some() {
-                tasks.push(list_dirs(&client, bucket.clone(), prefix, token));
+                tasks.push(list_dirs(
+                    &client,
+                    bucket.clone(),
+                    prefix,
+                    token,
+                    sender.clone(),
+                ));
             }
         }
     }
 
-    println!("{:#?}", full_dirs);
-    println!("{:#?}", full_objects);
-}
-
-trait Took {
-    fn took(&mut self, n: usize) -> Self;
-}
-
-impl<T> Took for Vec<T> {
-    fn took(&mut self, n: usize) -> Self {
-        let mut res = Vec::new();
-
-        for _i in 0..n {
-            let element = self.pop();
-            if let Some(x) = element {
-                res.push(x)
-            } else {
-                break;
-            }
-        }
-
-        res
+    for object in full_objects {
+        println!("{}", object.key.unwrap());
     }
 }
