@@ -1,118 +1,152 @@
 use failure::Error;
-use futures::future::join_all;
+use futures::stream::{self, Stream, StreamExt};
+use regex::Regex;
 use rusoto_core::Region;
 use rusoto_s3::*;
-use std::process::exit;
+use std::str::FromStr;
+use structopt::clap::AppSettings;
+use structopt::StructOpt;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 
-type S3List = (
-    Vec<Option<String>>,
-    Vec<Object>,
-    Option<String>,
-    Option<String>,
-);
+#[derive(StructOpt, Debug, Clone)]
+#[structopt(
+    name = "s3walk",
+    global_settings(&[AppSettings::ColoredHelp, AppSettings::NeedsLongHelp, AppSettings::NeedsSubcommandHelp])
+)]
+struct Opts {
+    /// S3 url, example s3://bucket/path
+    #[structopt(name = "path")]
+    path: S3Path,
 
-async fn list_dirs(
-    client: &S3Client,
+    /// Level concurrency to speedup
+    #[structopt(name = "level", long = "concurrency", default_value = "8")]
+    concurrent: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct S3Path {
+    pub bucket: String,
+    pub prefix: Option<String>,
+}
+
+const PARSE_ERROR: &str = "Cannnot parse s3 uri";
+
+impl FromStr for S3Path {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let regex =
+            Regex::new(r#"s3://([\d\w _-]+)(/([\d\w/ _-]*))?"#).map_err(|x| x.to_string())?;
+        let captures = regex.captures(s).ok_or(PARSE_ERROR)?;
+
+        let bucket = captures
+            .get(1)
+            .map(|x| x.as_str().to_owned())
+            .ok_or(PARSE_ERROR)?;
+        let prefix = captures.get(3).map(|x| x.as_str().to_owned());
+
+        Ok(S3Path { bucket, prefix })
+    }
+}
+
+fn print(items: Option<Vec<Object>>) {
+    if let Some(list) = items {
+        //println!("{:?}", list);
+        list.into_iter()
+            .for_each(|object| println!("{}", object.key.unwrap_or_else(|| "".to_owned())))
+    }
+}
+
+async fn stream_walk_prefix(
+    client: S3Client,
     bucket: String,
     path: Option<String>,
-    token: Option<String>,
-) -> Result<S3List, Error> {
-    let req = ListObjectsV2Request {
-        bucket: bucket.clone(),
-        delimiter: Some("/".to_owned()),
-        prefix: path.clone(),
-        continuation_token: token,
-        max_keys: Some(2),
-        ..Default::default()
-    };
-    let rs = client.list_objects_v2(req).await?;
+    sender: Sender<Option<String>>,
+) -> impl Stream<Item = Option<Vec<Object>>> {
+    let token = None;
+    let stream = stream::unfold(
+        (client, bucket, path, false, token, sender),
+        |(client, bucket, path, last, token, sender)| async move {
+            if last {
+                return None;
+            }
 
-    let ListObjectsV2Output {
-        common_prefixes,
-        contents,
-        next_continuation_token,
-        ..
-    } = rs;
+            let req = ListObjectsV2Request {
+                bucket: bucket.clone(),
+                delimiter: Some("/".to_owned()),
+                prefix: path.clone(),
+                continuation_token: token.clone(),
+                max_keys: Some(2),
+                ..Default::default()
+            };
 
-    let common: Vec<_> = common_prefixes
-        .unwrap_or_else(Vec::new)
-        .into_iter()
-        .map(|x| {
-            let CommonPrefix { prefix } = x;
-            prefix
-        })
-        .collect();
+            let rs = client.list_objects_v2(req).await.unwrap();
 
-    let contents = contents.unwrap_or_else(Vec::new);
+            //println!("{:?}", &rs);
+            let ListObjectsV2Output {
+                next_continuation_token,
+                common_prefixes,
+                contents,
+                ..
+            } = rs.clone();
 
-    Ok((common, contents, path, next_continuation_token))
+            if let Some(prefixes) = common_prefixes {
+                let mut s = sender.clone();
+                for prefix in prefixes.into_iter() {
+                    s.send(prefix.prefix).await.unwrap();
+                }
+            }
+
+            let state = (
+                client,
+                bucket,
+                path,
+                next_continuation_token.is_none(),
+                next_continuation_token,
+                sender,
+            );
+            Some((contents, state))
+        },
+    );
+    stream
+}
+
+async fn stream_walk(
+    client: S3Client,
+    bucket: String,
+    receiver: Receiver<Option<String>>,
+    sender: Sender<Option<String>>,
+) -> impl Stream<Item = impl Stream<Item = Option<Vec<Object>>>> {
+    let stream = stream::unfold(
+        (client, bucket, receiver, sender),
+        |(client, bucket, mut receiver, sender)| async move {
+            if let Some(key) = receiver.recv().await {
+                let stream =
+                    stream_walk_prefix(client.clone(), bucket.clone(), key, sender.clone()).await;
+                let state = (client, bucket, receiver, sender);
+                Some((stream, state))
+            } else {
+                None
+            }
+        },
+    );
+    stream
 }
 
 #[tokio::main]
 async fn main() {
+    let opts = Opts::from_args();
+
     let client = S3Client::new(Region::UsEast1);
-    let bucket = "ander-test".to_owned();
-    let path = None;
+    let S3Path { bucket, prefix } = opts.path;
 
-    let mut search_paths = vec![path];
-    let mut full_dirs = Vec::new();
-    let mut full_objects = Vec::new();
-    let parallel = 8_usize;
-    let mut tasks = Vec::new();
+    let (mut sender, receiver) = channel::<Option<String>>(1000);
+    sender.send(prefix.clone()).await.unwrap();
 
-    while !search_paths.is_empty() {
-        let slice_paths = search_paths.took(parallel - tasks.len());
-        full_dirs.append(&mut slice_paths.clone());
-
-        let mut new_tasks: Vec<_> = slice_paths
-            .into_iter()
-            .map(|prefix| list_dirs(&client, bucket.clone(), prefix, None))
-            .collect();
-
-        new_tasks.append(&mut tasks);
-
-        let results: Vec<_> = join_all(new_tasks)
-            .await
-            .into_iter()
-            .filter_map(|x| {
-                x.map_err(|e| {
-                    eprintln!("{}", e);
-                    exit(1);
-                })
-                .ok()
-            })
-            .collect();
-
-        for (mut dirs, mut objects, prefix, token) in results.into_iter() {
-            search_paths.append(&mut dirs);
-            full_objects.append(&mut objects);
-            if token.is_some() {
-                tasks.push(list_dirs(&client, bucket.clone(), prefix, token));
-            }
-        }
-    }
-
-    println!("{:#?}", full_dirs);
-    println!("{:#?}", full_objects);
-}
-
-trait Took {
-    fn took(&mut self, n: usize) -> Self;
-}
-
-impl<T> Took for Vec<T> {
-    fn took(&mut self, n: usize) -> Self {
-        let mut res = Vec::new();
-
-        for _i in 0..n {
-            let element = self.pop();
-            if let Some(x) = element {
-                res.push(x)
-            } else {
-                break;
-            }
-        }
-
-        res
-    }
+    stream_walk(client, bucket, receiver, sender)
+        .await
+        .for_each_concurrent(opts.concurrent, |st| async move {
+            st.map(print).collect::<Vec<_>>().await;
+        })
+        .await;
 }
