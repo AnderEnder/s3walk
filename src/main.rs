@@ -1,23 +1,19 @@
-use crossbeam_channel::{unbounded, Receiver, Sender};
 use failure::Error;
 use futures::future::join_all;
 use rusoto_core::Region;
 use rusoto_s3::*;
 use std::process::exit;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 
-type S3List = (
-    Vec<Option<String>>,
-    Vec<Object>,
-    Option<String>,
-    Option<String>,
-);
+type S3List = (Option<String>, Option<String>);
 
 async fn list_dirs(
     client: &S3Client,
     bucket: String,
     path: Option<String>,
     token: Option<String>,
-    sender: Sender<Option<String>>,
+    mut sender: Sender<Option<String>>,
+    mut key_sender: Sender<Object>,
 ) -> Result<S3List, Error> {
     let req = ListObjectsV2Request {
         bucket: bucket.clone(),
@@ -47,13 +43,23 @@ async fn list_dirs(
 
     let contents = contents.unwrap_or_else(Vec::new);
 
-    for prefix in common.iter() {
+    for prefix in common {
         if let Some(p) = prefix {
-            sender.send(Some(p.to_owned())).unwrap();
+            sender.send(Some(p.to_owned())).await?;
         }
     }
 
-    Ok((common, contents, path, next_continuation_token))
+    for key in contents {
+        key_sender.send(key).await?;
+    }
+
+    Ok((path, next_continuation_token))
+}
+
+async fn execute(mut receiver: Receiver<Object>) {
+    while let Some(key) = receiver.recv().await {
+        println!("{}", key.key.unwrap_or_else(|| "".to_owned()));
+    }
 }
 
 #[tokio::main]
@@ -62,26 +68,44 @@ async fn main() {
     let bucket = "ander-test".to_owned();
     let path = None;
 
-    let (sender, receiver) = unbounded::<Option<String>>();
-    sender.send(path.clone()).unwrap();
+    let (sender, mut receiver) = channel::<Option<String>>(1000);
+    let (key_send, key_recv) = channel::<Object>(10000);
 
-    let mut full_objects = Vec::new();
+    tokio::spawn(execute(key_recv));
+
     let parallel = 8_usize;
-    let mut tasks = Vec::new();
+    let mut tasks = vec![list_dirs(
+        &client,
+        bucket.clone(),
+        path,
+        None,
+        sender.clone(),
+        key_send.clone(),
+    )];
 
-    while !receiver.is_empty() || tasks.len() != 0 {
-        let mut new_tasks: Vec<_> = (0..(parallel - tasks.len()))
-            .filter_map(|_| match receiver.try_recv() {
-                Ok(path) => Some(list_dirs(
-                    &client,
-                    bucket.clone(),
-                    path,
-                    None,
-                    sender.clone(),
-                )),
-                _ => None,
-            })
-            .collect();
+    'main: loop {
+        let mut new_tasks = Vec::new();
+
+        for _ in 0..(parallel - tasks.len()) {
+            match receiver.try_recv() {
+                Ok(path) => {
+                    let task = list_dirs(
+                        &client,
+                        bucket.clone(),
+                        path,
+                        None,
+                        sender.clone(),
+                        key_send.clone(),
+                    );
+                    new_tasks.push(task);
+                }
+                _ => {
+                    if tasks.is_empty() && new_tasks.is_empty() {
+                        break 'main;
+                    }
+                }
+            };
+        }
 
         new_tasks.append(&mut tasks);
 
@@ -97,21 +121,18 @@ async fn main() {
             })
             .collect();
 
-        for (mut _dirs, mut objects, prefix, token) in results.into_iter() {
-            full_objects.append(&mut objects);
+        for (prefix, token) in results {
             if token.is_some() {
-                tasks.push(list_dirs(
+                let task = list_dirs(
                     &client,
                     bucket.clone(),
                     prefix,
                     token,
                     sender.clone(),
-                ));
+                    key_send.clone(),
+                );
+                tasks.push(task);
             }
         }
-    }
-
-    for object in full_objects {
-        println!("{}", object.key.unwrap());
     }
 }
