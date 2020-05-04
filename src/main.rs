@@ -3,19 +3,17 @@ use futures::future::join_all;
 use rusoto_core::Region;
 use rusoto_s3::*;
 use std::process::exit;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 
-type S3List = (
-    Vec<Option<String>>,
-    Vec<Object>,
-    Option<String>,
-    Option<String>,
-);
+type S3List = (Option<String>, Option<String>);
 
 async fn list_dirs(
     client: &S3Client,
     bucket: String,
     path: Option<String>,
     token: Option<String>,
+    mut sender: Sender<Option<String>>,
+    mut key_sender: Sender<Object>,
 ) -> Result<S3List, Error> {
     let req = ListObjectsV2Request {
         bucket: bucket.clone(),
@@ -45,7 +43,23 @@ async fn list_dirs(
 
     let contents = contents.unwrap_or_else(Vec::new);
 
-    Ok((common, contents, path, next_continuation_token))
+    for prefix in common {
+        if let Some(p) = prefix {
+            sender.send(Some(p.to_owned())).await?;
+        }
+    }
+
+    for key in contents {
+        key_sender.send(key).await?;
+    }
+
+    Ok((path, next_continuation_token))
+}
+
+async fn execute(mut receiver: Receiver<Object>) {
+    while let Some(key) = receiver.recv().await {
+        println!("{}", key.key.unwrap_or_else(|| "".to_owned()));
+    }
 }
 
 #[tokio::main]
@@ -54,20 +68,44 @@ async fn main() {
     let bucket = "ander-test".to_owned();
     let path = None;
 
-    let mut search_paths = vec![path];
-    let mut full_dirs = Vec::new();
-    let mut full_objects = Vec::new();
+    let (sender, mut receiver) = channel::<Option<String>>(1000);
+    let (key_send, key_recv) = channel::<Object>(10000);
+
+    tokio::spawn(execute(key_recv));
+
     let parallel = 8_usize;
-    let mut tasks = Vec::new();
+    let mut tasks = vec![list_dirs(
+        &client,
+        bucket.clone(),
+        path,
+        None,
+        sender.clone(),
+        key_send.clone(),
+    )];
 
-    while !search_paths.is_empty() {
-        let slice_paths = search_paths.took(parallel - tasks.len());
-        full_dirs.append(&mut slice_paths.clone());
+    'main: loop {
+        let mut new_tasks = Vec::new();
 
-        let mut new_tasks: Vec<_> = slice_paths
-            .into_iter()
-            .map(|prefix| list_dirs(&client, bucket.clone(), prefix, None))
-            .collect();
+        for _ in 0..(parallel - tasks.len()) {
+            match receiver.try_recv() {
+                Ok(path) => {
+                    let task = list_dirs(
+                        &client,
+                        bucket.clone(),
+                        path,
+                        None,
+                        sender.clone(),
+                        key_send.clone(),
+                    );
+                    new_tasks.push(task);
+                }
+                _ => {
+                    if tasks.is_empty() && new_tasks.is_empty() {
+                        break 'main;
+                    }
+                }
+            };
+        }
 
         new_tasks.append(&mut tasks);
 
@@ -83,36 +121,18 @@ async fn main() {
             })
             .collect();
 
-        for (mut dirs, mut objects, prefix, token) in results.into_iter() {
-            search_paths.append(&mut dirs);
-            full_objects.append(&mut objects);
+        for (prefix, token) in results {
             if token.is_some() {
-                tasks.push(list_dirs(&client, bucket.clone(), prefix, token));
+                let task = list_dirs(
+                    &client,
+                    bucket.clone(),
+                    prefix,
+                    token,
+                    sender.clone(),
+                    key_send.clone(),
+                );
+                tasks.push(task);
             }
         }
-    }
-
-    println!("{:#?}", full_dirs);
-    println!("{:#?}", full_objects);
-}
-
-trait Took {
-    fn took(&mut self, n: usize) -> Self;
-}
-
-impl<T> Took for Vec<T> {
-    fn took(&mut self, n: usize) -> Self {
-        let mut res = Vec::new();
-
-        for _i in 0..n {
-            let element = self.pop();
-            if let Some(x) = element {
-                res.push(x)
-            } else {
-                break;
-            }
-        }
-
-        res
     }
 }
