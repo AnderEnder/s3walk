@@ -18,6 +18,6 @@ default-features = false
 features = [ "rustls" ]
 
 [dependencies.rusoto_s3]
-version = "0.45"
+version = "0.48"
 default-features = false
 features = [ "rustls" ]
