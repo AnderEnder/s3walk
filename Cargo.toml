@@ -13,7 +13,7 @@ futures = "0.3"
 tokio = { version = "0.3", features = ["full"] }
 
 [dependencies.rusoto_core]
-version = "0.45"
+version = "0.48"
 default-features = false
 features = [ "rustls" ]
 
